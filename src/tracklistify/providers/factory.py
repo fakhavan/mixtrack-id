@@ -1,12 +1,25 @@
 """Provider factory for creating track identification providers."""
 
 # Standard library imports
+import os
 import threading
+from typing import TYPE_CHECKING, Optional
 
 # Local imports
+from tracklistify.core.exceptions import ConfigError
+
+if TYPE_CHECKING:
+    from tracklistify.providers.musicbrainz import MusicBrainzProvider
+    from tracklistify.providers.spotify import SpotifyProvider
 
 _provider_factory = None
 _provider_lock = threading.Lock()
+
+# Provider names this factory knows how to build. Keep in sync with the
+# branches in ProviderFactory.get_identification_provider — the invariant
+# test in tests/test_handoff_invariants.py checks each name constructs
+# (or fails with a clear ConfigError, never a TypeError).
+KNOWN_PROVIDERS = ("shazam", "acrcloud")
 
 
 def create_provider_factory() -> "ProviderFactory":
@@ -65,11 +78,97 @@ class ProviderFactory:
             elif provider_name == "acrcloud":
                 from tracklistify.providers.acrcloud import ACRCloudProvider
 
-                provider = ACRCloudProvider()
+                # Credentials are read from the environment (documented in
+                # .env.example), NOT from the config dataclass — keeping
+                # secrets off the dataclass avoids leaking them via repr()
+                # or error messages.
+                access_key = os.getenv("TRACKLISTIFY_ACR_ACCESS_KEY")
+                access_secret = os.getenv("TRACKLISTIFY_ACR_ACCESS_SECRET")
+                if not access_key or not access_secret:
+                    raise ConfigError(
+                        "ACRCloud provider requires TRACKLISTIFY_ACR_ACCESS_KEY "
+                        "and TRACKLISTIFY_ACR_ACCESS_SECRET in the environment "
+                        "or .env file. Get credentials at "
+                        "https://console.acrcloud.com/ or use "
+                        "`--provider shazam` (no credentials needed)."
+                    )
+                host = os.getenv(
+                    "TRACKLISTIFY_ACR_HOST", "identify-eu-west-1.acrcloud.com"
+                )
+                provider = ACRCloudProvider(
+                    access_key=access_key,
+                    access_secret=access_secret,
+                    host=host,
+                )
             else:
-                raise ValueError(f"Unknown provider: {provider_name}")
+                raise ValueError(
+                    f"Unknown provider: {provider_name!r}. "
+                    f"Known providers: {', '.join(KNOWN_PROVIDERS)}"
+                )
             self.providers[provider_name] = provider
             return provider
+
+    # Cache key for the enrichment-only Spotify provider. Distinct from any
+    # identification provider name (KNOWN_PROVIDERS) so it cannot collide, and
+    # leading underscore keeps it out of the identification name space.
+    _SPOTIFY_ENRICHMENT_KEY = "_spotify_enrichment"
+
+    def get_spotify_provider(self) -> "Optional[SpotifyProvider]":
+        """Return a configured Spotify enrichment provider, or None.
+
+        Reads ``TRACKLISTIFY_SPOTIFY_CLIENT_ID`` and
+        ``TRACKLISTIFY_SPOTIFY_CLIENT_SECRET`` from the environment, following
+        the ACRCloud env-only pattern — secrets are deliberately NOT on the
+        config dataclass (they would leak through ``repr()`` and validation
+        error messages).
+
+        Unlike ``get_identification_provider`` for ACRCloud, missing
+        credentials return ``None`` rather than raising ``ConfigError``:
+        identification *requires* its provider, enrichment does not. Absent
+        creds are a skip, not an error. The instance is cached under a
+        non-colliding key so ``close_all()`` closes its aiohttp session; no
+        new lifecycle code.
+        """
+        cached = self.providers.get(self._SPOTIFY_ENRICHMENT_KEY)
+        if cached is not None:
+            return cached
+
+        client_id = os.getenv("TRACKLISTIFY_SPOTIFY_CLIENT_ID")
+        client_secret = os.getenv("TRACKLISTIFY_SPOTIFY_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            return None
+
+        from tracklistify.providers.spotify import SpotifyProvider
+
+        provider = SpotifyProvider(client_id=client_id, client_secret=client_secret)
+        self.providers[self._SPOTIFY_ENRICHMENT_KEY] = provider
+        return provider
+
+    # Cache key for the keyless MusicBrainz enrichment provider. Distinct from
+    # any identification provider name so it cannot collide; the leading
+    # underscore keeps it out of the identification name space.
+    _MUSICBRAINZ_ENRICHMENT_KEY = "_musicbrainz_enrichment"
+
+    def get_musicbrainz_provider(self) -> "Optional[MusicBrainzProvider]":
+        """Return the keyless MusicBrainz enrichment provider.
+
+        MusicBrainz needs no credentials — the only configuration is an
+        optional descriptive User-Agent (``TRACKLISTIFY_MUSICBRAINZ_CONTACT``,
+        read inside the provider). Unlike ``get_spotify_provider``, this
+        always returns a provider (the hook gates on
+        ``musicbrainz_enabled``); it returns ``None`` only if the factory
+        cannot build one, which it currently never does. Cached under a
+        non-colliding key so ``close_all()`` closes its aiohttp session.
+        """
+        cached = self.providers.get(self._MUSICBRAINZ_ENRICHMENT_KEY)
+        if cached is not None:
+            return cached
+
+        from tracklistify.providers.musicbrainz import MusicBrainzProvider
+
+        provider = MusicBrainzProvider()
+        self.providers[self._MUSICBRAINZ_ENRICHMENT_KEY] = provider
+        return provider
 
     async def close_all(self) -> None:
         """Close all providers."""

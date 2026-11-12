@@ -15,6 +15,10 @@ from tracklistify.core.exceptions import ExportError
 from tracklistify.core.track import Track
 from tracklistify.utils.logger import get_logger
 
+# Precompiled sanitization patterns for clean_string (called per track).
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*@]')
+_MULTISPACE_RE = re.compile(r"\s+")
+
 logger = get_logger(__name__)
 
 
@@ -38,18 +42,18 @@ class TracklistOutput:
         self.mix_info = mix_info or {}
         self.tracks = tracks
         self._config = get_config()
-        self.output_dir = Path(self._config.output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+        # Each run produces a self-contained subfolder under output_dir,
+        # named from the mix metadata. The folder is the identity; files
+        # inside use fixed names (tracklist.{ext}).
+        self.output_dir = Path(self._config.output_dir) / self._format_subfolder_name()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _format_filename(self, extension: str) -> str:
-        """
-        Generate filename in format: [YYYYMMDD] Artist - Description.extension
+    def _format_subfolder_name(self) -> str:
+        """Build the per-set subfolder name from mix metadata.
 
-        Args:
-            extension: File extension without dot
-
-        Returns:
-            Formatted filename
+        Format: ``[YYYYMMDD] Artist - Description`` (same stem as the old
+        flat filename, minus the extension). Used as the self-contained
+        output directory for a single run.
         """
         # Get date in YYYYMMDD format
         mix_date = self.mix_info.get("date", datetime.now().strftime("%Y-%m-%d"))
@@ -66,11 +70,8 @@ class TracklistOutput:
 
         # Clean up special characters but preserve spaces and basic punctuation
         def clean_string(s: str) -> str:
-            # Replace invalid filename characters with spaces
-            s = re.sub(r'[<>:"/\\|?*@]', " ", s)
-            # Replace multiple spaces with single space
-            s = re.sub(r"\s+", " ", s)
-            # Strip leading/trailing spaces
+            s = _INVALID_FILENAME_CHARS_RE.sub(" ", s)
+            s = _MULTISPACE_RE.sub(" ", s)
             return s.strip()
 
         # Clean and format parts
@@ -89,8 +90,16 @@ class TracklistOutput:
         if venue:
             description = f"{title} | {venue}"
 
-        # Format filename
-        return f"[{mix_date}] {artist} - {description}.{extension}"
+        return f"[{mix_date}] {artist} - {description}"
+
+    def _format_filename(self, extension: str) -> str:
+        """Build a filename inside the subfolder.
+
+        Files use fixed names (``tracklist.{ext}``) since the subfolder is
+        the identity. Kept for backwards compatibility with callers/tests
+        that build paths from the formatted name.
+        """
+        return f"tracklist.{extension}"
 
     def save(self, format_type: str) -> Optional[Path]:
         """
@@ -153,13 +162,26 @@ class TracklistOutput:
                     "time_in_mix": track.time_in_mix,
                     "confidence": track.confidence,
                     "duration": getattr(track, "duration", None),
+                    "metadata": getattr(track, "metadata", None) or None,
                 }
                 for track in self.tracks
             ],
         }
 
+        # Serialize fully in memory before touching the file. ``json.dump``
+        # streams, so a TypeError partway through leaves a truncated file
+        # that looks like a finished tracklist — and this runs AFTER the
+        # whole expensive identification pass, so a corrupt write is the
+        # most costly moment to fail.
+        #
+        # ``default=str`` is the safety net: ``Track.metadata`` is opaque
+        # pass-through, currently only ever provider strings, but the
+        # planned Spotify/MusicBrainz enrichment (BACKLOG P2/P3) will feed
+        # it values like datetimes straight from a client library. Falling
+        # back to str() degrades one field instead of losing the export.
+        payload = json.dumps(data, indent=4, ensure_ascii=False, default=str)
         with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.write(payload)
 
         logger.info("Analysis Summary:")
         logger.info(f"- Total tracks: {data['analysis_info']['track_count']}")
@@ -200,21 +222,64 @@ class TracklistOutput:
         return output_file
 
     def _save_m3u(self) -> Path:
-        """Save tracks as M3U playlist."""
+        """Save a playable, self-contained M3U playlist.
+
+        Each entry points at the single audio file in the subfolder and uses
+        VLC's ``#EXTVLCOPT:start-time`` for per-track seeking (the standard
+        way to seek within one file in M3U; works in VLC, the natural player
+        for DJ mixes). EXTINF duration is the gap to the next track's start;
+        the last track's duration is ``total_duration - last_start`` (or -1
+        when total_duration is unknown, which VLC/players treat as live).
+        """
         output_file = self.output_dir / self._format_filename("m3u")
+        audio_filename = self.mix_info.get("audio_filename", "")
+        total_duration = self.mix_info.get("total_duration", 0) or 0
+
+        # Precompute start offsets; time_in_mix is "H+:MM:SS" (hours unbounded).
+        starts = [self._time_in_mix_to_seconds(t.time_in_mix) for t in self.tracks]
 
         with open(output_file, "w", encoding="utf-8") as f:
             f.write("#EXTM3U\n")
 
-            for track in self.tracks:
-                duration = getattr(track, "duration", -1)
-                f.write(f"#EXTINF:{duration},{track.artist} - {track.song_name}\n")
-                # Note: Since we don't have actual file paths,
-                # we add a comment with the time in mix
-                f.write(f"# Time in mix: {track.time_in_mix}\n")
+            for i, track in enumerate(self.tracks):
+                start = starts[i]
+                # Duration = gap to next track; last track uses the remainder.
+                if i + 1 < len(starts):
+                    duration = starts[i + 1] - start
+                elif total_duration > 0:
+                    duration = total_duration - start
+                else:
+                    duration = -1
+
+                f.write(f"#EXTINF:{int(duration)},{track.artist} - {track.song_name}\n")
+                if start > 0:
+                    f.write(f"#EXTVLCOPT:start-time={int(start)}\n")
+                if audio_filename:
+                    f.write(f"{audio_filename}\n")
 
         logger.info(f"Saved M3U playlist to: {output_file}")
         return output_file
+
+    @staticmethod
+    def _time_in_mix_to_seconds(time_in_mix: str) -> float:
+        """Parse an "H+:MM:SS" timestamp (hours unbounded) to seconds.
+
+        Tolerant of missing hours (``MM:SS``). Returns 0 on any parse
+        failure rather than raising — a malformed timestamp should not
+        abort the whole playlist.
+        """
+        parts = str(time_in_mix).split(":")
+        try:
+            parts = [float(p) for p in parts]
+        except ValueError:
+            return 0.0
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 1:
+            return parts[0]
+        return 0.0
 
     def save_all(self) -> List[Path]:
         """

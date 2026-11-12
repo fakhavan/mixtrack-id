@@ -130,6 +130,13 @@ class RateLimiter:
                 concurrent = max_concurrent_requests or getattr(
                     self._config, "spotify_max_concurrent", 20
                 )
+            elif provider_str == "musicbrainz":
+                rpm = max_requests_per_minute or getattr(
+                    self._config, "musicbrainz_max_rpm", 30
+                )
+                concurrent = max_concurrent_requests or getattr(
+                    self._config, "musicbrainz_max_concurrent", 1
+                )
             else:
                 # Fall back to global config or defaults
                 rpm = max_requests_per_minute or getattr(
@@ -248,6 +255,17 @@ class RateLimiter:
             # release before propagating so we don't strand a slot.
             limits.semaphore.release()
             raise
+
+    def record_result(self, provider: Any, success: bool) -> None:
+        """Record the outcome of a provider request for the circuit breaker.
+
+        Callers MUST invoke this after each provider request (success=True
+        on a normal response, False on an exception) or the circuit
+        breaker never learns about failures and never opens. The
+        identification loop in ``utils/identification.py`` is the primary
+        caller.
+        """
+        self._update_circuit_breaker(provider, success)
 
     def release(self, provider: Any):
         """Release a concurrent request slot."""

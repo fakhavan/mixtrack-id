@@ -17,6 +17,7 @@ from typing import List, Optional
 from mutagen import File
 
 # Local/package imports
+from tracklistify.cache.download import DownloadCache
 from tracklistify.core.exceptions import TrackIdentificationError
 from tracklistify.core.track import Track
 from tracklistify.core.types import AudioSegment
@@ -43,6 +44,7 @@ class AsyncApp:
         self.config = config or get_config(force_refresh=True)
         self.provider_factory = create_provider_factory()
         self.downloader_factory = DownloaderFactory()
+        self.download_cache = DownloadCache(Path(self.config.cache_dir))
         self.logger = get_logger(__name__)
         self.shutdown_event = asyncio.Event()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -94,6 +96,55 @@ class AsyncApp:
         self.shutdown_event.set()
         self.executor.shutdown(wait=True)
 
+    # Map probed audio codec -> a file suffix whose ffmpeg muxer accepts that
+    # codec under -c:a copy. The cached download blob is extensionless, so
+    # split_audio (which derives the muxer from Path(file_path).suffix) needs a
+    # suffix that matches the *bytes*, not yt-dlp's container label (which can
+    # disagree — e.g. an mp3 stream served in a webm container).
+    _CODEC_SUFFIXES = {
+        "mp3": ".mp3",
+        "aac": ".m4a",
+        "opus": ".opus",
+        "vorbis": ".ogg",
+        "flac": ".flac",
+        "wav": ".wav",
+        "pcm_s16le": ".wav",
+        "pcm_s24le": ".wav",
+    }
+
+    def _probe_codec_suffix(self, path: Path) -> str:
+        """Probe ``path``'s audio codec via ffprobe; return a ffmpeg-safe suffix.
+
+        Returns ``""`` on any failure (probe missing, non-zero exit, unknown
+        codec) so the caller falls back to the extensionless blob path —
+        split_audio then defaults to ``.mp3``.
+        """
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return ""
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a:0",
+                    "-show_entries",
+                    "stream=codec_name",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=FFMPEG_SEGMENT_TIMEOUT,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        codec = result.stdout.strip().lower()
+        return self._CODEC_SUFFIXES.get(codec, "")
+
     async def process_input(
         self,
         input_path: str,
@@ -101,6 +152,7 @@ class AsyncApp:
         provider: str = None,
         fallback_enabled: bool = None,
         stream_copy: bool = False,
+        cache_enabled: bool = None,
     ):
         """Process input URL or file path.
 
@@ -111,6 +163,8 @@ class AsyncApp:
             fallback_enabled: Enable/disable fallback - overrides config if provided
             stream_copy: If True, skip yt-dlp's MP3 transcode and segment with
                 ``-c:a copy`` end-to-end. Faster but keeps the source codec.
+            cache_enabled: Enable/disable BOTH caches - overrides config if
+                provided. False makes the run re-download and re-identify.
         """
         try:
             # Apply CLI argument overrides to config
@@ -125,6 +179,21 @@ class AsyncApp:
             if fallback_enabled is not None:
                 self.logger.info(f"Overriding fallback_enabled: {fallback_enabled}")
                 self.config.fallback_enabled = fallback_enabled
+
+            if cache_enabled is False:
+                # --no-cache means REFRESH, not disable. Both read paths
+                # are skipped and both writes still fire, so the stale
+                # entry is overwritten rather than merely stepped around.
+                # Turning the caches off entirely would leave the bad
+                # result on disk to be served again on the next normal
+                # run — the opposite of what someone chasing a wrong
+                # identification wants.
+                #
+                # Both layers, deliberately: a user has no way to know
+                # whether the stale answer lives in the identification
+                # cache or in the downloaded audio it was derived from.
+                self.logger.info("Cache refresh requested: ignoring stored results")
+                self.config.cache_refresh = True
 
             # Store formats for output. When formats is None, leave
             # _output_formats unset so the save block falls back to
@@ -163,16 +232,77 @@ class AsyncApp:
                 )
                 if downloader is None:
                     raise ValueError("Failed to create downloader")
-                self.logger.info("Downloading audio...")
-                local_path = await downloader.download(validated_path)
+
+                # Download cache (URL-keyed, per-provider canonical). A hit
+                # skips the network entirely and reads metadata from the
+                # sidecar; a miss downloads then populates the cache. Gated
+                # by config.download_cache_enabled. Failures degrade to a
+                # live download — never abort the run.
+                #
+                # ``cache_refresh`` (--no-cache) skips this read only; the
+                # write below still fires, so the stale blob is replaced.
+                local_path = None
+                metadata = None
+                if self.config.download_cache_enabled and not getattr(
+                    self.config, "cache_refresh", False
+                ):
+                    try:
+                        cached = await self.download_cache.get(
+                            validated_path, stream_copy
+                        )
+                    except Exception as e:
+                        self.logger.debug(f"Download cache get failed: {e}")
+                        cached = None
+                    if cached is not None:
+                        # The cached blob is extensionless (named by hash).
+                        # split_audio derives the ffmpeg muxer from the path
+                        # suffix and uses -c:a copy, so the suffix must match
+                        # the *actual audio codec*, not the container label in
+                        # the sidecar (which can disagree — e.g. an mp3 stream
+                        # served inside a webm container). Probe the codec and
+                        # hardlink the blob to <hash>.<codec-suffix>. Falls
+                        # back to the raw blob path on any failure (split_audio
+                        # then defaults to .mp3).
+                        blob = cached.audio_path
+                        suffix = self._probe_codec_suffix(blob)
+                        if suffix:
+                            suffixed = blob.with_suffix(suffix)
+                            try:
+                                if not suffixed.exists():
+                                    os.link(blob, suffixed)
+                                local_path = str(suffixed)
+                            except OSError:
+                                local_path = str(blob)
+                        else:
+                            local_path = str(blob)
+                        metadata = cached.metadata
+                        self.logger.info(f"Download cache hit: {local_path}")
+
                 if local_path is None:
-                    raise ValueError("local_path cannot be None")
-                self.logger.info(f"Downloaded audio to: {local_path}")
+                    self.logger.info("Downloading audio...")
+                    downloaded = await downloader.download(validated_path)
+                    if downloaded is None:
+                        raise ValueError("local_path cannot be None")
+                    self.logger.info(f"Downloaded audio to: {downloaded}")
+                    local_path = downloaded
+                    metadata = (
+                        getattr(downloader, "get_last_metadata", lambda: None)() or {}
+                    )
+                    # Populate the cache (best-effort).
+                    if self.config.download_cache_enabled:
+                        try:
+                            await self.download_cache.set(
+                                validated_path,
+                                stream_copy,
+                                Path(local_path),
+                                metadata,
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"Download cache set failed: {e}")
 
                 # Store metadata for output
-                metadata = getattr(downloader, "get_last_metadata", lambda: None)()
                 if metadata:
-                    self.logger.debug(f"yt-dlp metadata keys: {list(metadata.keys())}")
+                    self.logger.debug(f"metadata keys: {list(metadata.keys())}")
                     self.original_title = sanitizer(metadata.get("title", ""))
                     self.uploader = sanitizer(metadata.get("uploader", ""))
                     try:
@@ -193,6 +323,12 @@ class AsyncApp:
                         self.duration = 0
 
             self.logger.info("Processing audio...")
+
+            # Remember the source audio path so save_output can copy it into
+            # the per-set subfolder (makes the output self-contained + M3U
+            # playable). Captured here so all three input branches (local file,
+            # cache hit, fresh download) are covered.
+            self.audio_source_path = local_path
 
             # Process the downloaded file. Pass through the duration we got
             # from yt-dlp (or local-file fallback below) so split_audio
@@ -284,6 +420,22 @@ class AsyncApp:
         segment_duration = self.config.segment_length
         overlap_duration = self.config.overlap_duration
         step = segment_duration - overlap_duration
+        # INVARIANT: step must be positive or the while-loop below never
+        # advances. Config validation enforces this at load time, but
+        # config attributes are mutable (CLI overrides mutate them), so
+        # guard again here — fail loud instead of looping forever.
+        if step <= 0:
+            raise ValueError(
+                f"segment_length ({segment_duration}) must exceed "
+                f"overlap_duration ({overlap_duration}); refusing to segment "
+                f"with a non-positive step of {step}s."
+            )
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "ffmpeg not found on PATH — segmentation cannot proceed. "
+                "Install it first (e.g. `apt install ffmpeg` or "
+                "`brew install ffmpeg`)."
+            )
 
         # Per-invocation temp dir (created in __init__) — every concurrent
         # run uses its own subdir so cleanup can't wipe peers' segments.
@@ -442,6 +594,32 @@ class AsyncApp:
             self.logger.error(f"Failed to process segments: {e}")
             return []
 
+    def _copy_audio_to_output(self, output_dir: Path, title: str) -> Optional[str]:
+        """Copy the source audio into the output subfolder.
+
+        Returns the relative filename of the copied audio (for the M3U), or
+        None if there is no source audio to copy. Best-effort: copy failures
+        are logged and skipped so the tracklist files still save.
+        """
+        src = getattr(self, "audio_source_path", None)
+        if not src:
+            return None
+        src_path = Path(src)
+        if not src_path.is_file():
+            self.logger.debug(f"Audio source missing, not copying: {src}")
+            return None
+        ext = src_path.suffix or ".mp3"
+        safe_title = sanitizer(title) if title else "audio"
+        dest_name = f"{safe_title}{ext}"
+        dest = output_dir / dest_name
+        try:
+            shutil.copy2(src_path, dest)
+            self.logger.debug(f"Copied audio to output: {dest}")
+            return dest_name
+        except OSError as e:
+            self.logger.warning(f"Could not copy audio to output: {e}")
+            return None
+
     async def save_output(self, tracks: List["Track"], format: str):
         """Save identified tracks to output files.
 
@@ -465,16 +643,29 @@ class AsyncApp:
             else:
                 title = "Identified Mix"
 
-        # Prepare mix info using the downloaded title
+        # Prepare mix info using the downloaded title and uploader.
+        # uploader comes from yt-dlp metadata (set in process_input); it
+        # populates the artist slot in the subfolder name and output formats.
         mix_info = {
             "title": title,
+            "artist": getattr(self, "uploader", "") or "",
             "date": datetime.now().strftime("%Y-%m-%d"),
             "track_count": len(tracks),
+            "total_duration": getattr(self, "duration", 0) or 0,
         }
 
         try:
-            # Create output handler
+            # Create output handler (this also creates the per-set subfolder).
             output = TracklistOutput(mix_info=mix_info, tracks=tracks)
+
+            # Copy the source audio into the subfolder so the output is
+            # self-contained and the M3U has a real, playable file to point
+            # at. Best-effort: a missing source (e.g. cleaned up) is skipped
+            # — the tracklist files still save, just without the audio.
+            audio_filename = self._copy_audio_to_output(output.output_dir, title)
+            if audio_filename:
+                mix_info["audio_filename"] = audio_filename
+                output.mix_info = mix_info
 
             # Save in specified format
             if format == "all":

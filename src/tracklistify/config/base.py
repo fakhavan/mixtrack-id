@@ -124,18 +124,21 @@ class BaseConfig:
     def _validate(self) -> None:
         """Validate all configuration values against defined rules.
 
-        This is a template method that subclasses can override to add
-        custom validation logic beyond the declarative rules.
-        Called automatically during __post_init__ after _setup_validation.
-
-        Subclasses should call super()._validate() first, then add
-        any additional validation that can't be expressed as rules.
+        This is a template method: it runs every rule registered in
+        ``_setup_validation`` against the dataclass fields. Subclasses
+        should call ``super()._validate()`` first, then add any
+        cross-field validation that can't be expressed as a single-field
+        rule.
 
         Raises:
-            ValueError: If any configuration value is invalid.
+            ValidationError: If any configuration value violates a rule.
         """
-        # Base class validation is handled by _validator
-        # Subclasses can override to add custom validation logic
+        # ConfigValidator.validate expects a plain dict; hand it only the
+        # declared dataclass fields (not private attrs like _validator).
+        values = {
+            name: getattr(self, name) for name in self.__class__.__dataclass_fields__
+        }
+        self._validator.validate(values)
 
 
 @dataclass
@@ -146,9 +149,13 @@ class TrackIdentificationConfig(BaseConfig):
 
     # Track identification specific fields
     segment_length: int = field(default=60)
-    min_confidence: float = field(default=0.5)
-    time_threshold: float = field(default=30.0)
-    max_duplicates: int = field(default=2)
+    min_confidence: float = field(default=0.0)
+    # 0.0 = derive the dedup window from the segmentation step
+    # (2 * (segment_length - overlap_duration)); a positive value overrides
+    # it. The old 30.0 default predates the window being wired at all — it
+    # is narrower than one segmentation step (50s), so it would split
+    # adjacent-segment detections of the same track.
+    time_threshold: float = field(default=0.0)
     overlap_duration: int = field(default=10)
     overlap_strategy: str = field(default="weighted")
     min_segment_length: int = field(default=10)
@@ -160,7 +167,16 @@ class TrackIdentificationConfig(BaseConfig):
 
     # Caching settings
     cache_enabled: bool = field(default=True)
-    cache_ttl: int = field(default=3600)
+    # 30 days. The identification cache is keyed on
+    # ``f"{provider}:{sha256(segment_bytes)}"`` — the segment hash IS the
+    # identity, so a stored Shazam/ACRCloud response for those exact bytes
+    # does not go stale the way a typical HTTP cache entry does. The old
+    # 1-hour default meant re-running yesterday's mix re-paid the full
+    # identification cost, with most entries still well within their
+    # useful life when they expired. A provider improving its catalog is
+    # the only real staleness here, and weeks is the right granularity for
+    # that — not an hour.
+    cache_ttl: int = field(default=2_592_000)
     # Byte budget for the cache (matches SizeStrategy / BaseCache semantics).
     # Previously defaulted to 1000 — meant as "entries" but interpreted as
     # bytes, which was so small the cache rejected every Shazam response.
@@ -170,8 +186,25 @@ class TrackIdentificationConfig(BaseConfig):
     cache_compression_level: int = field(default=6)
     cache_cleanup_enabled: bool = field(default=True)
     cache_cleanup_interval: int = field(default=3600)
-    cache_max_age: int = field(default=86400)
+    # Must not be shorter than cache_ttl: these are two independent expiry
+    # gates reading different fields — ``JSONStorage.cleanup()``
+    # (cache/storage.py, via ``BaseCache.cleanup()``) reads max_age, while
+    # ``TTLStrategy`` reads ttl on lookup — and the shorter one wins.
+    #
+    # The hazard is currently LATENT, not live: nothing in production
+    # calls ``BaseCache.cleanup()``. It has no scheduler, and
+    # ``cache_cleanup_enabled``/``cache_cleanup_interval`` below are read
+    # by no code at all (``AsyncApp.cleanup()`` only clears temp dirs).
+    # Kept in step anyway, so that wiring the janitor up later cannot
+    # silently start deleting entries the TTL still considers valid.
+    cache_max_age: int = field(default=2_592_000)
     cache_min_free_space: int = field(default=104857600)
+    # Per-run switch set by ``--no-cache``: skip cache READS while leaving
+    # writes live, so stored results are refreshed rather than bypassed.
+    # Not a persistent preference — there is no reason to want every run to
+    # ignore its own cache — so it is deliberately CLI-only and absent from
+    # .env.example (see FIELD_SECTIONS in scripts/generate_env_example.py).
+    cache_refresh: bool = field(default=False)
 
     # Rate limiting settings
     rate_limit_enabled: bool = field(default=True)
@@ -192,10 +225,30 @@ class TrackIdentificationConfig(BaseConfig):
     shazam_max_rpm: int = field(default=25)
     shazam_max_concurrent: int = field(default=1)
     shazam_cooldown_seconds: float = field(default=2.25)
+    shazam_proxy: str = field(default="")
 
     # Spotify rate limits (consumed by RateLimiter.register_provider)
     spotify_max_rpm: int = field(default=120)
     spotify_max_concurrent: int = field(default=20)
+
+    # Metadata enrichment: after dedup, resolve a canonical Spotify track link
+    # per unique track (ISRC-first, title/artist fallback). A silent no-op
+    # when Spotify credentials are absent, so ``true`` is a safe default.
+    enrichment_enabled: bool = field(default=True)
+
+    # MusicBrainz link enrichment (keyless, free): a second source that
+    # resolves canonical streaming URLs (Spotify/Deezer/Tidal/Apple/Beatport)
+    # via the ISRC lookup. Runs after the Spotify source; first-writer-wins
+    # per link key. ~20% Spotify-link coverage on underground/EDM (measured
+    # 2026-08-04); additive, not exclusive. A no-op without an ISRC.
+    musicbrainz_enabled: bool = field(default=True)
+    # MusicBrainz rate-limits with 503 under burst load even well under its
+    # 1200/min ceiling. Serialize (concurrent=1) and pace at ~30rpm — gentler
+    # than the spec's "~1 req/s" asks, but a burst at higher concurrency
+    # triggers a 503 storm the bounded retry can't absorb (measured 2026-08-04:
+    # bursted hook resolved 3% vs paced 23% on the same ISRCs).
+    musicbrainz_max_rpm: int = field(default=30)
+    musicbrainz_max_concurrent: int = field(default=1)
 
     # Output formats
     output_format: str = field(default="json")
@@ -204,6 +257,7 @@ class TrackIdentificationConfig(BaseConfig):
     download_quality: str = field(default="192")
     download_format: str = field(default="mp3")
     download_max_retries: int = field(default=3)
+    download_cache_enabled: bool = field(default=True)
 
     def __post_init__(self):
         """Initialize configuration after dataclass creation.
@@ -224,14 +278,12 @@ class TrackIdentificationConfig(BaseConfig):
         self._validator.add_type_rule("overlap_duration", int)
         self._validator.add_type_rule("min_confidence", float)
         self._validator.add_type_rule("time_threshold", float)
-        self._validator.add_type_rule("max_duplicates", int)
 
         # Add range validation rules
         self._validator.add_range_rule("segment_length", 10, 300)
         self._validator.add_range_rule("overlap_duration", 0, 30)
         self._validator.add_range_rule("min_confidence", 0.0, 1.0)
         self._validator.add_range_rule("time_threshold", 0.0, 300.0)
-        self._validator.add_range_rule("max_duplicates", 0, 10)
 
         # Add path validation rules for directories
         path_requirements = {PathRequirement.IS_DIR, PathRequirement.WRITABLE}
@@ -244,3 +296,18 @@ class TrackIdentificationConfig(BaseConfig):
         self._validator.add_rule(
             PathRule("temp_dir", path_requirements, create_if_missing=True)
         )
+
+    def _validate(self) -> None:
+        """Run declarative rules, then cross-field checks."""
+        super()._validate()
+
+        # INVARIANT: segmentation step = segment_length - overlap_duration
+        # must be positive, or AsyncApp.split_audio's while-loop never
+        # advances (infinite loop, unbounded memory). Guarded again at the
+        # split site because config attributes are mutable after init.
+        if self.overlap_duration >= self.segment_length:
+            raise ValueError(
+                f"overlap_duration ({self.overlap_duration}) must be smaller "
+                f"than segment_length ({self.segment_length}); the segmenter "
+                f"advances by segment_length - overlap_duration each step."
+            )

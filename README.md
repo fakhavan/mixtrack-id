@@ -1,3 +1,7 @@
+> **About this repository:** a copy of [tracklistify](https://pypi.org/project/tracklistify/) **v0.10.1** by betmoar (MIT licence, see `LICENSE`), kept because the original GitHub repository is no longer available. The Python package and its `tracklistify` command keep their original name. `src/tracklistify` was restored byte-for-byte from an installed v0.10.1 build (every file matches its wheel `RECORD` checksum); `README.md` and the `pyproject.toml` dependencies come from that build's metadata, plus `aiofiles`, which the code imports directly and v0.10.1 only got through an older shazamio. Tests and docs are from the last commit available locally and may predate v0.10.1.
+
+Install: `pip install "tracklistify @ git+https://github.com/fakhavan/mixtrack-id.git@v0.10.1"`
+
 ![Tracklistify banner](docs/assets/banner.png)
 
 <div align="center">

@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "tracklistify"
-version = "0.7.0"
+version = "0.10.1"
 description = "Automatic tracklist generator for DJ mixes and audio streams"
 readme = "README.md"
 authors = [
@@ -24,14 +24,17 @@ classifiers = [
 ]
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "aiohttp>=3.13.4",
-    "mutagen>=1.47.0",
+    "aiohttp>=3.14.1",
+    "mutagen>=1.48.1",
     "pydub>=0.25.1",
     "python-dotenv>=1.2.2",
-    "requests>=2.32.5",
-    "yt-dlp[default]>=2026.03.17",
+    "requests>=2.33.0",
+    "yt-dlp[default]>=2026.7.4",
     "shazamio>=0.8.1",
-    "click>=8.3.1",
+    # Imported directly by tracklistify.cache.storage; v0.10.1 only got it through
+    # shazamio 0.8.1, and newer shazamio releases no longer pull it in.
+    "aiofiles>=23.2.1",
+    "click>=8.4.2",
     # audioop was removed from the stdlib in Python 3.13 (PEP 594) but pydub
     # still imports it; this maintained backport restores the symbol.
     "audioop-lts>=0.2.1 ; python_version >= '3.13'",
@@ -62,9 +65,9 @@ tracklistify = "tracklistify.cli:cli"
 tracklistify-dev = "tracklistify.dev_cli.cli:cli"
 
 [project.urls]
-homepage = "https://github.com/betmoar/tracklistify"
-repository = "https://github.com/betmoar/tracklistify.git"
-documentation = "https://github.com/betmoar/tracklistify#readme"
+homepage = "https://github.com/fakhavan/mixtrack-id"
+repository = "https://github.com/fakhavan/mixtrack-id.git"
+documentation = "https://github.com/fakhavan/mixtrack-id#readme"
 
 [tool.bandit]
 # Security pattern scan; medium+ severity blocks commits (-ll in hook args).
